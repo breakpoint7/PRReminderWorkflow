@@ -1,0 +1,733 @@
+# Reference workflow: copy this file to .github/workflows/ to activate it.
+name: Remind about merge-ready pull requests
+
+# Run automatically each day and allow maintainers to test it manually.
+on:
+  schedule:
+    # Format: "minute hour day-of-month month day-of-week" (all times are UTC).
+    # Example: "17 14 * * 1-5" runs at 14:17 UTC every Monday through Friday.
+    # Choose a non-round minute to reduce delays during busy scheduling periods.
+    - cron: "17 14 * * *"
+  workflow_dispatch:
+
+# Read PR state and checks, then write reminder comments back to the PR.
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+  issues: write
+  pull-requests: write
+  
+# Avoid overlapping runs posting duplicate comments.
+concurrency:
+  group: merge-ready-reminder
+  cancel-in-progress: false
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    env:
+      # Initial grace period shared by every actionable PR category.
+      MIN_READY_HOURS: "24"
+      # Cooldown before repeating a reminder for the same category and head commit.
+      REPEAT_REMINDER_HOURS: "24"
+
+    steps:
+      - name: Find and remind merge-ready pull requests
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Validate the two user-editable timing settings before calling GitHub.
+            const minimumReadyHours = Number(process.env.MIN_READY_HOURS);
+            if (!Number.isFinite(minimumReadyHours) || minimumReadyHours < 0) {
+              core.setFailed("MIN_READY_HOURS must be a non-negative number.");
+              return;
+            }
+            const repeatReminderHours = Number(process.env.REPEAT_REMINDER_HOURS);
+            if (!Number.isFinite(repeatReminderHours) || repeatReminderHours < 0) {
+              core.setFailed(
+                "REPEAT_REMINDER_HOURS must be a non-negative number.",
+              );
+              return;
+            }
+
+            // Load every open PR; paginate so repositories with over 100 PRs are covered.
+            const pullRequests = await github.paginate(
+              github.rest.pulls.list,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: "open",
+                per_page: 100,
+              },
+            );
+
+            // Accumulate one result row per PR for the final run summary.
+            let remindersSent = 0;
+            const results = [];
+            const mergeabilityAttempts = 5;
+            const mergeabilityRetryMilliseconds = 2000;
+
+            // Terminal results that require someone to address or rerun a check.
+            const failedCheckConclusions = new Set([
+              "action_required",
+              "cancelled",
+              "failure",
+              "stale",
+              "startup_failure",
+              "timed_out",
+            ]);
+            const failedStatusStates = new Set(["error", "failure"]);
+
+            // Shared helpers record results, normalize retries, and manage reminder history.
+            function recordResult(pr, category, outcome, details) {
+              results.push({
+                pr: `[#${pr.number}](${pr.html_url})`,
+                author: `@${pr.user.login}`,
+                category,
+                outcome,
+                details,
+              });
+              core.info(`${category}/${outcome}: PR #${pr.number} - ${details}`);
+            }
+
+            function latestBy(items, identity, timestamp) {
+              // Retries can return several records for one check; only its newest state matters.
+              const latest = new Map();
+              for (const item of items) {
+                const key = identity(item);
+                const itemTime = Date.parse(timestamp(item) ?? "");
+                const existing = latest.get(key);
+                const existingTime = existing
+                  ? Date.parse(timestamp(existing) ?? "")
+                  : Number.NEGATIVE_INFINITY;
+                if (!existing || itemTime > existingTime) {
+                  latest.set(key, item);
+                }
+              }
+              return [...latest.values()];
+            }
+
+            function describeHours(hours) {
+              return hours >= 48
+                ? `${Math.floor(hours / 24)} days`
+                : `${Math.floor(hours)} hours`;
+            }
+
+            async function getNotificationHistory(pr, category) {
+              // Category + head SHA keep reminder history scoped to one cause and revision.
+              const marker = `<!-- merge-ready-reminder:${category}:${pr.head.sha} -->`;
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                per_page: 100,
+              });
+              const legacyMarker = `<!-- merge-ready-reminder:${pr.head.sha} -->`;
+              const matchingComments = comments.filter(
+                (comment) =>
+                  comment.body?.includes(marker) ||
+                  (category === "merge-ready" &&
+                    comment.body?.includes(legacyMarker)),
+              );
+              const lastNotifiedAt = Math.max(
+                ...matchingComments.map((comment) => Date.parse(comment.created_at)),
+              );
+              return {
+                marker,
+                previousCount: matchingComments.length,
+                lastNotifiedAt: Number.isFinite(lastNotifiedAt)
+                  ? lastNotifiedAt
+                  : null,
+              };
+            }
+
+            function getRepeatReminderState(notification) {
+              if (notification.lastNotifiedAt === null) {
+                return { shouldNotify: true, elapsedHours: null };
+              }
+
+              const elapsedHours =
+                (Date.now() - notification.lastNotifiedAt) / (60 * 60 * 1000);
+              return {
+                shouldNotify: elapsedHours >= repeatReminderHours,
+                elapsedHours,
+              };
+            }
+
+            async function getPullRequestWithMergeability(pullNumber) {
+              // The first REST read often returns null while GitHub computes mergeability.
+              for (let attempt = 1; attempt <= mergeabilityAttempts; attempt += 1) {
+                const { data: pr } = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pullNumber,
+                });
+                const isCalculated =
+                  pr.mergeable !== null && pr.mergeable_state !== "unknown";
+
+                if (isCalculated || attempt === mergeabilityAttempts) {
+                  return pr;
+                }
+
+                core.info(
+                  `Mergeability is not calculated for PR #${pullNumber}; retrying (${attempt}/${mergeabilityAttempts}).`,
+                );
+                await new Promise((resolve) =>
+                  setTimeout(resolve, mergeabilityRetryMilliseconds),
+                );
+              }
+            }
+
+            // Evaluate PRs independently so every open PR appears in the summary.
+            for (const pullRequest of pullRequests) {
+              core.startGroup(`PR #${pullRequest.number}: ${pullRequest.title}`);
+
+              const pr = await getPullRequestWithMergeability(pullRequest.number);
+
+              core.info(`URL: ${pr.html_url}`);
+              core.info(`Author: @${pr.user.login}`);
+              core.info(`Head SHA: ${pr.head.sha}`);
+              core.info(`Draft: ${pr.draft}`);
+              core.info(`Mergeable: ${pr.mergeable}`);
+              core.info(`Mergeable state: ${pr.mergeable_state}`);
+              core.info(`Auto-merge enabled: ${pr.auto_merge !== null}`);
+
+              // Do not remind on states that need author action beyond checks or reviews.
+              const nonActionableReason =
+                pr.draft
+                  ? "draft"
+                  : pr.auto_merge
+                    ? "auto-merge enabled"
+                    : pr.mergeable === false || pr.mergeable_state === "dirty"
+                      ? "merge conflict"
+                      : pr.mergeable === null || pr.mergeable_state === "unknown"
+                        ? "mergeability is still being calculated"
+                        : null;
+
+              if (nonActionableReason) {
+                recordResult(pr, "NON_ACTIONABLE", "SKIPPED", nonActionableReason);
+                core.endGroup();
+                continue;
+              }
+
+              // Gather check, review, comparison, and timeline evidence in parallel.
+              const [
+                { data: commit },
+                { data: combinedStatus },
+                allCheckRuns,
+                reviews,
+                timelineEvents,
+                { data: baseComparison },
+                reviewState,
+              ] = await Promise.all([
+                github.rest.repos.getCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: pr.head.sha,
+                }),
+                github.rest.repos.getCombinedStatusForRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: pr.head.sha,
+                }),
+                github.paginate(github.rest.checks.listForRef, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: pr.head.sha,
+                  per_page: 100,
+                }),
+                github.paginate(github.rest.pulls.listReviews, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pullRequest.number,
+                  per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listEventsForTimeline, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pullRequest.number,
+                  per_page: 100,
+                }),
+                github.rest.repos.compareCommitsWithBasehead({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${pr.base.sha}...${pr.head.sha}`,
+                }),
+                github.graphql(
+                  `query($owner: String!, $repo: String!, $number: Int!) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        reviewDecision
+                        reviewRequests(first: 100) {
+                          nodes {
+                            requestedReviewer {
+                              __typename
+                              ... on User {
+                                login
+                              }
+                              ... on Team {
+                                slug
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }`,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    number: pullRequest.number,
+                  },
+                ),
+              ]);
+
+              // Collapse repeated check runs and statuses to their newest current result.
+              const checkRuns = latestBy(
+                allCheckRuns,
+                (run) => `${run.app?.slug ?? run.app?.id ?? "unknown"}:${run.name}`,
+                (run) => run.completed_at ?? run.started_at ?? run.created_at,
+              );
+              const statuses = latestBy(
+                combinedStatus.statuses,
+                (status) => status.context,
+                (status) => status.updated_at ?? status.created_at,
+              );
+              const failedChecks = [
+                ...checkRuns
+                  .filter((run) => failedCheckConclusions.has(run.conclusion))
+                  .map((run) => ({
+                    name: run.name,
+                    timestamp: run.completed_at ?? run.started_at ?? run.created_at,
+                  })),
+                ...statuses
+                  .filter((status) => failedStatusStates.has(status.state))
+                  .map((status) => ({
+                    name: status.context,
+                    timestamp: status.updated_at ?? status.created_at,
+                  })),
+              ];
+
+              // 1. Failed checks are the most specific blocker and take precedence.
+              if (failedChecks.length > 0) {
+                const failedAt = Math.max(
+                  ...failedChecks.map((check) => Date.parse(check.timestamp ?? "")),
+                );
+                const failedHours = (Date.now() - failedAt) / (60 * 60 * 1000);
+                const failedNames = [...new Set(failedChecks.map((check) => check.name))];
+                const details = `failed: ${failedNames.join(", ")}`;
+
+                if (!Number.isFinite(failedAt)) {
+                  recordResult(
+                    pr,
+                    "CHECKS_FAILED_IDLE",
+                    "WAITING",
+                    `${details}; could not determine failure time`,
+                  );
+                  core.endGroup();
+                  continue;
+                }
+
+                core.info(`Latest current failure: ${new Date(failedAt).toISOString()}`);
+                core.info(`Failed-check age: ${failedHours.toFixed(1)} hours`);
+
+                if (failedHours < minimumReadyHours) {
+                  recordResult(
+                    pr,
+                    "CHECKS_FAILED_IDLE",
+                    "WAITING",
+                    `${details}; failed for ${failedHours.toFixed(1)}h; threshold is ${minimumReadyHours}h`,
+                  );
+                  core.endGroup();
+                  continue;
+                }
+
+                const notification = await getNotificationHistory(
+                  pr,
+                  "checks-failed",
+                );
+                const repeatState = getRepeatReminderState(notification);
+                if (!repeatState.shouldNotify) {
+                  recordResult(
+                    pr,
+                    "CHECKS_FAILED_IDLE",
+                    "RECENTLY_NOTIFIED",
+                    `${details}; last reminded ${repeatState.elapsedHours.toFixed(1)}h ago; repeats after ${repeatReminderHours}h`,
+                  );
+                  core.endGroup();
+                  continue;
+                }
+
+                const failedDescription = describeHours(failedHours);
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pullRequest.number,
+                  body: [
+                    `@${pr.user.login}, this pull request has had failed checks with no successful rerun for about ${failedDescription}.`,
+                    "",
+                    `Failed checks: ${failedNames.map((name) => `\`${name}\``).join(", ")}`,
+                    "",
+                    "Please address or rerun the failed checks, or close/update the pull request if it should not proceed.",
+                    "",
+                    notification.marker,
+                  ].join("\n"),
+                });
+                remindersSent += 1;
+                recordResult(
+                  pr,
+                  "CHECKS_FAILED_IDLE",
+                  notification.previousCount > 0 ? "RENOTIFIED" : "NOTIFIED",
+                  `${details}; failed for about ${failedDescription}`,
+                );
+                core.endGroup();
+                continue;
+              }
+
+              // 2. A branch behind its base must be updated before later gates matter.
+              if (baseComparison.behind_by > 0) {
+                const { data: reverseComparison } =
+                  await github.rest.repos.compareCommitsWithBasehead({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    basehead: `${pr.head.sha}...${pr.base.sha}`,
+                    per_page: 1,
+                  });
+                const firstMissingBaseCommit = reverseComparison.commits[0];
+                const headCommitTimestamp =
+                  commit.commit.committer?.date ?? commit.commit.author?.date;
+                const outdatedEvents = [
+                  firstMissingBaseCommit?.commit.committer?.date ??
+                    firstMissingBaseCommit?.commit.author?.date,
+                  pr.created_at,
+                  headCommitTimestamp,
+                ].filter(Boolean);
+                const outdatedAt = Math.max(
+                  ...outdatedEvents.map((timestamp) => Date.parse(timestamp)),
+                );
+                const outdatedHours =
+                  (Date.now() - outdatedAt) / (60 * 60 * 1000);
+                const details =
+                  `${baseComparison.behind_by} commit(s) behind ${pr.base.ref}`;
+
+                if (!Number.isFinite(outdatedAt)) {
+                  recordResult(
+                    pr,
+                    "BASE_BRANCH_OUTDATED_IDLE",
+                    "WAITING",
+                    `${details}; could not determine outdated time`,
+                  );
+                  core.endGroup();
+                  continue;
+                }
+
+                core.info(
+                  `Approximate outdated time: ${new Date(outdatedAt).toISOString()}`,
+                );
+                core.info(`Outdated age: ${outdatedHours.toFixed(1)} hours`);
+
+                if (outdatedHours < minimumReadyHours) {
+                  recordResult(
+                    pr,
+                    "BASE_BRANCH_OUTDATED_IDLE",
+                    "WAITING",
+                    `${details}; outdated for ${outdatedHours.toFixed(1)}h; threshold is ${minimumReadyHours}h`,
+                  );
+                  core.endGroup();
+                  continue;
+                }
+
+                const notification = await getNotificationHistory(
+                  pr,
+                  "base-outdated",
+                );
+                const repeatState = getRepeatReminderState(notification);
+                if (!repeatState.shouldNotify) {
+                  recordResult(
+                    pr,
+                    "BASE_BRANCH_OUTDATED_IDLE",
+                    "RECENTLY_NOTIFIED",
+                    `${details}; last reminded ${repeatState.elapsedHours.toFixed(1)}h ago; repeats after ${repeatReminderHours}h`,
+                  );
+                  core.endGroup();
+                  continue;
+                }
+
+                const outdatedDescription = describeHours(outdatedHours);
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pullRequest.number,
+                  body: [
+                    `@${pr.user.login}, this pull request has been out of date with \`${pr.base.ref}\` for about ${outdatedDescription}.`,
+                    "",
+                    `The branch is ${baseComparison.behind_by} commit(s) behind the base branch.`,
+                    "",
+                    "Please update the branch from the base branch so its checks and merge requirements can be evaluated against current code.",
+                    "",
+                    notification.marker,
+                  ].join("\n"),
+                });
+                remindersSent += 1;
+                recordResult(
+                  pr,
+                  "BASE_BRANCH_OUTDATED_IDLE",
+                  notification.previousCount > 0 ? "RENOTIFIED" : "NOTIFIED",
+                  `${details}; outdated for about ${outdatedDescription}`,
+                );
+                core.endGroup();
+                continue;
+              }
+
+              // 3. GraphQL fills review-decision and team-request gaps in REST data.
+              const graphReview =
+                reviewState.repository?.pullRequest ?? {};
+              const graphRequests =
+                graphReview.reviewRequests?.nodes
+                  ?.map((request) => request.requestedReviewer)
+                  .filter(Boolean) ?? [];
+              const requestedUserLogins = new Set([
+                ...(pr.requested_reviewers ?? []).map((reviewer) => reviewer.login),
+                ...graphRequests
+                  .filter((reviewer) => reviewer.__typename === "User")
+                  .map((reviewer) => reviewer.login),
+              ]);
+              const requestedTeamSlugs = new Set([
+                ...(pr.requested_teams ?? []).map((team) => team.slug),
+                ...graphRequests
+                  .filter((reviewer) => reviewer.__typename === "Team")
+                  .map((reviewer) => reviewer.slug),
+              ]);
+              const isReviewRequired =
+                graphReview.reviewDecision === "REVIEW_REQUIRED";
+
+              if (
+                requestedUserLogins.size > 0 ||
+                requestedTeamSlugs.size > 0 ||
+                isReviewRequired
+              ) {
+                // Notify the author and any reviewer identities visible to this token.
+                // Timeline events provide a stable clock; PR updated_at includes unrelated activity.
+                let matchingRequestEvents = timelineEvents.filter(
+                  (event) =>
+                    event.event === "review_requested" &&
+                    (requestedUserLogins.has(event.requested_reviewer?.login) ||
+                      requestedTeamSlugs.has(event.requested_team?.slug)),
+                );
+                if (matchingRequestEvents.length === 0 && isReviewRequired) {
+                  matchingRequestEvents = timelineEvents.filter(
+                    (event) => event.event === "review_requested",
+                  );
+                }
+                const requestedAt = Math.max(
+                  ...matchingRequestEvents.map((event) => Date.parse(event.created_at)),
+                );
+                const requestedHours =
+                  (Date.now() - requestedAt) / (60 * 60 * 1000);
+                const requestedMentions = [
+                  ...[...requestedUserLogins].map((login) => `@${login}`),
+                  ...[...requestedTeamSlugs].map(
+                    (slug) => `@${context.repo.owner}/${slug}`,
+                  ),
+                ];
+                const details =
+                  requestedMentions.length > 0
+                    ? `waiting on ${requestedMentions.join(", ")}`
+                    : "required review is still outstanding";
+
+                if (!Number.isFinite(requestedAt)) {
+                  recordResult(
+                    pr,
+                    "REVIEWERS_MISSING_IDLE",
+                    "WAITING",
+                    `${details}; could not determine request time`,
+                  );
+                  core.endGroup();
+                  continue;
+                }
+
+                core.info(
+                  `Latest current review request: ${new Date(requestedAt).toISOString()}`,
+                );
+                core.info(`Review-request age: ${requestedHours.toFixed(1)} hours`);
+
+                if (requestedHours < minimumReadyHours) {
+                  recordResult(
+                    pr,
+                    "REVIEWERS_MISSING_IDLE",
+                    "WAITING",
+                    `${details}; requested for ${requestedHours.toFixed(1)}h; threshold is ${minimumReadyHours}h`,
+                  );
+                  core.endGroup();
+                  continue;
+                }
+
+                const notification = await getNotificationHistory(
+                  pr,
+                  "reviewers-missing",
+                );
+                const repeatState = getRepeatReminderState(notification);
+                if (!repeatState.shouldNotify) {
+                  recordResult(
+                    pr,
+                    "REVIEWERS_MISSING_IDLE",
+                    "RECENTLY_NOTIFIED",
+                    `${details}; last reminded ${repeatState.elapsedHours.toFixed(1)}h ago; repeats after ${repeatReminderHours}h`,
+                  );
+                  core.endGroup();
+                  continue;
+                }
+
+                const requestedDescription = describeHours(requestedHours);
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pullRequest.number,
+                  body: [
+                    `${[`@${pr.user.login}`, ...requestedMentions].join(" ")}, this pull request has been waiting for required review for about ${requestedDescription}.`,
+                    "",
+                    "Please review it when appropriate, or update the requested reviewers if ownership has changed.",
+                    "",
+                    notification.marker,
+                  ].join("\n"),
+                });
+                remindersSent += 1;
+                recordResult(
+                  pr,
+                  "REVIEWERS_MISSING_IDLE",
+                  notification.previousCount > 0 ? "RENOTIFIED" : "NOTIFIED",
+                  `${details}; requested for about ${requestedDescription}`,
+                );
+                core.endGroup();
+                continue;
+              }
+
+              // 4. With no earlier blocker, remind only when GitHub permits the merge.
+              // mergeable_state "clean" means required checks and reviews are
+              // satisfied and the branch has no conflicts.
+              const isReady =
+                pr.mergeable === true && pr.mergeable_state === "clean";
+
+              if (!isReady) {
+                recordResult(
+                  pr,
+                  "NOT_READY",
+                  "SKIPPED",
+                  `mergeable=${pr.mergeable}, mergeable_state=${pr.mergeable_state}`,
+                );
+                core.endGroup();
+                continue;
+              }
+
+              const readinessEvents = [
+                // GitHub has no "became ready" timestamp, so use the newest relevant event.
+                commit.commit.committer?.date ?? commit.commit.author?.date,
+                ...statuses.map((status) => status.updated_at ?? status.created_at),
+                ...checkRuns.map((run) => run.completed_at),
+                ...reviews
+                  .filter((review) => review.state === "APPROVED")
+                  .map((review) => review.submitted_at),
+              ].filter(Boolean);
+
+              const readyAt = Math.max(
+                ...readinessEvents.map((timestamp) => Date.parse(timestamp)),
+              );
+              const readyHours = (Date.now() - readyAt) / (60 * 60 * 1000);
+
+              if (!Number.isFinite(readyAt)) {
+                recordResult(
+                  pr,
+                  "MERGE_READY_IDLE",
+                  "WAITING",
+                  "could not determine ready time",
+                );
+                core.endGroup();
+                continue;
+              }
+
+              core.info(`Approximate ready time: ${new Date(readyAt).toISOString()}`);
+              core.info(`Ready age: ${readyHours.toFixed(1)} hours`);
+
+              if (readyHours < minimumReadyHours) {
+                recordResult(
+                  pr,
+                  "MERGE_READY_IDLE",
+                  "WAITING",
+                  `ready for ${readyHours.toFixed(1)}h; threshold is ${minimumReadyHours}h`,
+                );
+                core.endGroup();
+                continue;
+              }
+
+              const notification = await getNotificationHistory(pr, "merge-ready");
+              const repeatState = getRepeatReminderState(notification);
+              if (!repeatState.shouldNotify) {
+                recordResult(
+                  pr,
+                  "MERGE_READY_IDLE",
+                  "RECENTLY_NOTIFIED",
+                  `last reminded ${repeatState.elapsedHours.toFixed(1)}h ago; repeats after ${repeatReminderHours}h`,
+                );
+                core.endGroup();
+                continue;
+              }
+
+              const readyDescription = describeHours(readyHours);
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pullRequest.number,
+                body: [
+                  `@${pullRequest.user.login}, this pull request has satisfied its reviews and checks and has been ready to merge for about ${readyDescription}.`,
+                  "",
+                  "Please merge it when appropriate, or close/update it if it should not be merged.",
+                  "",
+                  notification.marker,
+                ].join("\n"),
+              });
+              remindersSent += 1;
+              recordResult(
+                pr,
+                "MERGE_READY_IDLE",
+                notification.previousCount > 0 ? "RENOTIFIED" : "NOTIFIED",
+                `ready for about ${readyDescription}`,
+              );
+              core.endGroup();
+            }
+
+            // Publish both a searchable log total and a human-readable run summary table.
+            core.info(
+              `Examined ${pullRequests.length} open pull request(s); sent ${remindersSent} reminder(s).`,
+            );
+
+            await core.summary
+              .addHeading("Pull request reminder results")
+              .addRaw(
+                `Examined ${pullRequests.length} open pull request(s); sent ${remindersSent} reminder(s).`,
+                true,
+              )
+              // Category explains why it is stuck; outcome explains what this run did.
+              .addTable([
+                [
+                  { data: "Pull request", header: true },
+                  { data: "Author", header: true },
+                  { data: "Category", header: true },
+                  { data: "Outcome", header: true },
+                  { data: "Details", header: true },
+                ],
+                ...results.map((result) => [
+                  result.pr,
+                  result.author,
+                  result.category,
+                  result.outcome,
+                  result.details,
+                ]),
+              ])
+              .write();
+
+            core.notice(
+              "The pull request results table is available on this workflow run's Summary page.",
+            );
+              
