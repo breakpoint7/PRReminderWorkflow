@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Find and remind merge-ready pull requests
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             // Validate the two user-editable timing settings before calling GitHub.
